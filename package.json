@@ -1,0 +1,87 @@
+{
+  "name": "silo-app",
+  "version": "0.1.0",
+  "description": "Secure Inference, Local Operations - Local AI Workbench",
+  "main": "./out/main/index.js",
+  "author": "SILO",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "build:unpack": "npm run build && electron-builder --dir",
+    "build:win": "npm run build && electron-builder --win",
+    "build:mac": "npm run build && electron-builder --mac",
+    "build:linux": "npm run build && electron-builder --linux",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web"
+  },
+  "dependencies": {
+    "@xenova/transformers": "^2.17.0",
+    "electron-ollama": "^0.1.25",
+    "electron-store": "^11.0.2",
+    "glob": "^10.3.0",
+    "mammoth": "^1.7.0",
+    "mime-types": "^2.1.35",
+    "pdf-parse": "^1.1.1",
+    "sharp": "^0.33.0",
+    "systeminformation": "^5.22.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@electron-toolkit/preload": "^3.0.0",
+    "@electron-toolkit/tsconfig": "^1.0.1",
+    "@electron-toolkit/utils": "^3.0.0",
+    "@rushstack/eslint-patch": "^1.10.4",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^20.14.0",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "@vue/eslint-config-prettier": "^9.0.0",
+    "@vue/eslint-config-typescript": "^13.0.0",
+    "@vue/tsconfig": "^0.8.1",
+    "@vueuse/core": "^10.9.0",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.0",
+    "electron-vite": "^2.3.0",
+    "eslint": "^8.57.0",
+    "eslint-plugin-vue": "^9.27.0",
+    "pinia": "^2.1.7",
+    "prettier": "^3.3.3",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.3.4",
+    "vue": "^3.4.35",
+    "vue-tsc": "^2.0.29"
+  },
+  "build": {
+    "appId": "build.hack.silo",
+    "productName": "SILO",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development"
+    }
+  }
+}
