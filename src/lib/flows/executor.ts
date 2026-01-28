@@ -1,9 +1,10 @@
 /**
  * SILO - Pipeline Executor
- * Executes pipelines step by step
+ * Executes pipelines step by step with multi-task support
  */
 
-import type { Flow, FlowStep, FlowContext, FlowCondition } from './schema'
+import type { Flow, FlowStep, FlowContext, FlowCondition, TaskType, ProviderType } from './schema'
+import { getStepTaskType, isVisionTask, isAudioTask, isTextTask } from './schema'
 
 export interface ExecutionCallbacks {
   onStepStart?: (step: FlowStep, index: number) => void
@@ -11,6 +12,15 @@ export interface ExecutionCallbacks {
   onStepError?: (step: FlowStep, index: number, error: Error) => void
   onProgress?: (current: number, total: number) => void
   onStreamChunk?: (chunk: string) => void
+}
+
+export interface ExecutionOptions {
+  /** Preferred provider for all tasks */
+  defaultProvider?: ProviderType
+  /** Enable fallback to other providers */
+  fallbackEnabled?: boolean
+  /** Default models by task type (from settings) */
+  defaultModels?: Partial<Record<TaskType, string>>
 }
 
 export interface ExecutionResult {
@@ -131,56 +141,207 @@ function resolveInput(step: FlowStep, context: FlowContext): string {
 async function executeStep(
   step: FlowStep,
   context: FlowContext,
+  options?: ExecutionOptions,
   callbacks?: ExecutionCallbacks
 ): Promise<string> {
   const input = resolveInput(step, context)
   const prompt = interpolate(step.prompt, context)
+  const taskType = getStepTaskType(step)
 
-  // Determine which model to use based on step.model type
-  // In a real implementation, this would use the settings store
-  // to get the appropriate model for the type
-  const modelMap: Record<string, string> = {
-    language: context.currentModel || 'llama3.2:3b',
-    vision: 'llava:7b',
-    audio: 'whisper'
-  }
-
-  const model = modelMap[step.model] || modelMap.language!
-
-  // Check if this is a vision model request with files
-  const isVisionStep = step.model === 'vision'
-  const hasImages = context.files && context.files.some(f => f.type.startsWith('image/'))
+  // Determine model to use
+  const modelId = step.modelId || options?.defaultModels?.[taskType]
+  const provider = step.provider || options?.defaultProvider
 
   try {
-    if (isVisionStep && hasImages && context.files) {
-      // Vision model with images
-      const images = context.files
-        .filter(f => f.type.startsWith('image/'))
-        .map(f => f.data || f.path)
-        .filter(Boolean) as string[]
-
-      const response = await window.silo.ollama.generate({
-        model,
-        prompt: `${prompt}\n\n${input}`,
-        images
-      })
-
-      return response.response
+    // Route to appropriate API based on task type
+    if (isVisionTask(taskType)) {
+      return await executeVisionTask(taskType, input, prompt, context, modelId, provider)
+    } else if (isAudioTask(taskType)) {
+      return await executeAudioTask(taskType, input, context, modelId, provider)
+    } else if (taskType === 'text-to-image') {
+      return await executeImageGenTask(input, prompt, modelId, provider)
+    } else if (taskType === 'embed') {
+      return await executeEmbedTask(input, modelId, provider)
     } else {
-      // Regular language model
-      const response = await window.silo.ollama.chat({
-        model,
-        messages: [
-          { role: 'system', content: prompt },
-          { role: 'user', content: input }
-        ]
-      })
-
-      return response.message.content
+      // Text-based tasks (chat, generate, summarize, etc.)
+      return await executeTextTask(taskType, input, prompt, context, modelId, provider)
     }
   } catch (error) {
     throw new Error(`Step "${step.name}" failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
   }
+}
+
+/**
+ * Execute a text-based task
+ */
+async function executeTextTask(
+  task: TaskType,
+  input: string,
+  prompt: string,
+  context: FlowContext,
+  modelId?: string,
+  provider?: ProviderType
+): Promise<string> {
+  // Check if this is a vision model request with files (legacy support)
+  const isLegacyVision = context.files && context.files.some(f => f.type.startsWith('image/'))
+
+  if (isLegacyVision && context.files) {
+    // Legacy vision model with images via Ollama
+    const images = context.files
+      .filter(f => f.type.startsWith('image/'))
+      .map(f => f.data || f.path)
+      .filter(Boolean) as string[]
+
+    const response = await window.silo.ollama.generate({
+      model: modelId?.replace(/^ollama:/, '') || 'llava:7b',
+      prompt: `${prompt}\n\n${input}`,
+      images
+    })
+
+    return response.response
+  }
+
+  // Use unified models API for text tasks
+  const response = await window.silo.models.chat({
+    model: modelId,
+    preferredProvider: provider,
+    messages: [
+      { role: 'system', content: prompt },
+      { role: 'user', content: input }
+    ]
+  })
+
+  return response.message.content
+}
+
+/**
+ * Execute a vision task
+ */
+async function executeVisionTask(
+  task: TaskType,
+  input: string,
+  prompt: string,
+  context: FlowContext,
+  modelId?: string,
+  provider?: ProviderType
+): Promise<string> {
+  // Get image from input or context files
+  let image = input
+
+  if (!image && context.files) {
+    const imageFile = context.files.find(f => f.type.startsWith('image/'))
+    if (imageFile) {
+      image = imageFile.data || imageFile.path
+    }
+  }
+
+  if (!image) {
+    throw new Error('No image provided for vision task')
+  }
+
+  const visionTask = task as 'image-classification' | 'object-detection' | 'image-segmentation' | 'depth-estimation' | 'image-to-text'
+
+  const response = await window.silo.models.vision({
+    task: visionTask,
+    image,
+    model: modelId,
+    preferredProvider: provider
+  })
+
+  // Format results based on task type
+  if (task === 'image-classification') {
+    const results = response.results as Array<{ label: string; score: number }>
+    return results.map(r => `${r.label}: ${(r.score * 100).toFixed(1)}%`).join('\n')
+  } else if (task === 'object-detection') {
+    const results = response.results as Array<{ label: string; score: number; box: any }>
+    return results.map(r => `${r.label} (${(r.score * 100).toFixed(1)}%)`).join('\n')
+  } else if (task === 'image-to-text') {
+    return response.results as string
+  } else if (task === 'depth-estimation') {
+    // Returns a depth map image as base64
+    return response.results as string
+  }
+
+  return JSON.stringify(response.results)
+}
+
+/**
+ * Execute an audio task
+ */
+async function executeAudioTask(
+  task: TaskType,
+  input: string,
+  context: FlowContext,
+  modelId?: string,
+  provider?: ProviderType
+): Promise<string> {
+  // Get audio from input or context files
+  let audio: string | undefined = input
+
+  if (!audio && context.files) {
+    const audioFile = context.files.find(f => f.type.startsWith('audio/'))
+    if (audioFile) {
+      audio = audioFile.path
+    }
+  }
+
+  if (!audio) {
+    throw new Error('No audio provided for audio task')
+  }
+
+  const audioTask = task as 'speech-to-text' | 'audio-classification'
+
+  const response = await window.silo.models.audio({
+    task: audioTask,
+    audio,
+    model: modelId,
+    preferredProvider: provider
+  })
+
+  if (task === 'speech-to-text') {
+    const result = response.result as { text: string }
+    return result.text
+  }
+
+  return JSON.stringify(response.result)
+}
+
+/**
+ * Execute an image generation task
+ */
+async function executeImageGenTask(
+  prompt: string,
+  systemPrompt: string,
+  modelId?: string,
+  provider?: ProviderType
+): Promise<string> {
+  const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt
+
+  const response = await window.silo.models.imageGen({
+    prompt: fullPrompt,
+    model: modelId,
+    preferredProvider: provider
+  })
+
+  return response.image
+}
+
+/**
+ * Execute an embedding task
+ */
+async function executeEmbedTask(
+  input: string,
+  modelId?: string,
+  provider?: ProviderType
+): Promise<string> {
+  const response = await window.silo.models.embed({
+    text: input,
+    model: modelId,
+    preferredProvider: provider
+  })
+
+  // Return embeddings as JSON string
+  return JSON.stringify(response.embeddings)
 }
 
 /**
@@ -189,7 +350,8 @@ async function executeStep(
 export async function executeFlow(
   flow: Flow,
   inputs: Record<string, string | string[] | boolean>,
-  callbacks?: ExecutionCallbacks
+  callbacks?: ExecutionCallbacks,
+  options?: ExecutionOptions
 ): Promise<ExecutionResult> {
   const startTime = Date.now()
   const context: FlowContext = {
@@ -202,11 +364,20 @@ export async function executeFlow(
   for (const [key, value] of Object.entries(inputs)) {
     const input = flow.inputs.find(i => i.name === key)
     if (input?.type === 'file' && typeof value === 'string') {
-      // In a real implementation, we'd read the file and get its data
+      // Determine file type from accepts or extension
+      let fileType = 'application/octet-stream'
+      if (input.accepts) {
+        if (input.accepts.some(a => a.includes('image'))) {
+          fileType = 'image/unknown'
+        } else if (input.accepts.some(a => a.includes('audio'))) {
+          fileType = 'audio/unknown'
+        }
+      }
+
       context.files?.push({
         name: key,
         path: value,
-        type: input.accepts?.[0]?.includes('image') ? 'image/unknown' : 'application/octet-stream'
+        type: fileType
       })
     }
   }
@@ -258,7 +429,7 @@ export async function executeFlow(
 
       // Execute the step
       try {
-        const result = await executeStep(step, context, callbacks)
+        const result = await executeStep(step, context, options, callbacks)
         context.stepResults[step.output] = result
         callbacks?.onStepComplete?.(step, currentStepIndex, result)
       } catch (error) {
@@ -315,13 +486,30 @@ export function validateInputs(
 }
 
 /**
- * Gets the models required by a flow
+ * Gets the task types required by a flow
+ */
+export function getRequiredTasks(flow: Flow): Set<TaskType> {
+  const tasks = new Set<TaskType>()
+
+  for (const step of flow.steps) {
+    tasks.add(getStepTaskType(step))
+  }
+
+  return tasks
+}
+
+/**
+ * Gets the models required by a flow (legacy)
  */
 export function getRequiredModels(flow: Flow): Set<string> {
   const models = new Set<string>()
 
   for (const step of flow.steps) {
-    models.add(step.model)
+    if (step.model) {
+      models.add(step.model)
+    } else if (step.task) {
+      models.add(step.task)
+    }
   }
 
   return models

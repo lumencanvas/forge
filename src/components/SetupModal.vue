@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useSetupStore } from '@/stores/setup'
 import { useSettingsStore } from '@/stores/settings'
 import { useHardwareStore } from '@/stores/hardware'
+import type { ModelPullProgress } from '../../electron/preload/index.d'
 
 const setupStore = useSetupStore()
 const settingsStore = useSettingsStore()
@@ -13,19 +14,27 @@ const emit = defineEmits<{
 }>()
 
 let cleanupPullProgress: (() => void) | undefined
+let cleanupStatusChange: (() => void) | undefined
 
 onMounted(() => {
-  cleanupPullProgress = window.silo.ollama.onPullProgress((data) => {
+  // Listen for model pull progress (unified API)
+  cleanupPullProgress = window.silo.models.onPullProgress((data: ModelPullProgress) => {
     setupStore.updatePullProgress(data.model, data.progress)
-    if (data.progress >= 100) {
+    if (data.status === 'complete') {
       setupStore.completePulling(data.model)
       refreshModels()
     }
+  })
+
+  // Listen for provider status changes
+  cleanupStatusChange = window.silo.models.onStatusChange((status) => {
+    setupStore.setProvidersStatus(status)
   })
 })
 
 onUnmounted(() => {
   cleanupPullProgress?.()
+  cleanupStatusChange?.()
 })
 
 // Run system checks when entering that step
@@ -45,7 +54,7 @@ async function runSystemChecks() {
     setupStore.updateCheck('Hardware Detection', {
       status: 'pass',
       message: `${info.tier.name} tier detected`,
-      details: `${info.gpu.name || 'No GPU'} • ${Math.round(info.memory.total / 1024)}GB RAM`
+      details: `${info.gpu.name || 'No GPU'} • ${Math.round(info.memory.total)}GB RAM`
     })
   } catch (e) {
     setupStore.updateCheck('Hardware Detection', {
@@ -55,47 +64,74 @@ async function runSystemChecks() {
     })
   }
 
-  // Ollama service
+  // Built-in Models (Transformers.js) - check first, this should always work
+  setupStore.updateCheck('Built-in Models', { status: 'checking' })
+  try {
+    const status = await window.silo.models.getStatus()
+    setupStore.setProvidersStatus(status)
+
+    const transformers = status.providers.find(p => p.type === 'transformers')
+    if (transformers?.status === 'available') {
+      const modelCount = transformers.models.length
+      setupStore.updateCheck('Built-in Models', {
+        status: 'pass',
+        message: 'Built-in AI ready',
+        details: `${modelCount} models available (~285MB total)`
+      })
+    } else {
+      setupStore.updateCheck('Built-in Models', {
+        status: 'warning',
+        message: 'Built-in models loading',
+        details: 'Models will download on first use'
+      })
+    }
+  } catch (e) {
+    setupStore.updateCheck('Built-in Models', {
+      status: 'warning',
+      message: 'Built-in models will load on demand',
+      details: 'First use may require download'
+    })
+  }
+
+  // Ollama service - optional, not blocking
   setupStore.updateCheck('Ollama Service', { status: 'checking' })
   try {
-    const models = await window.silo.ollama.listModels()
-    if (models && models.models) {
-      setupStore.updateCheck('Ollama Service', {
-        status: 'pass',
-        message: 'Ollama is running',
-        details: `${models.models.length} model(s) installed`
-      })
-      setupStore.setInstalledModels(models.models)
-    } else {
+    const result = await window.silo.ollama.listModels()
+
+    if (result.status === 'error' || result.error) {
       setupStore.updateCheck('Ollama Service', {
         status: 'warning',
-        message: 'Ollama connected but no models found',
-        details: 'You\'ll need to install at least one model'
+        message: 'Ollama not installed',
+        details: 'Optional: Install for larger models'
+      })
+    } else if (result.models && result.models.length > 0) {
+      setupStore.updateCheck('Ollama Service', {
+        status: 'pass',
+        message: 'Ollama connected',
+        details: `${result.models.length} model(s) installed`
+      })
+      setupStore.setInstalledModels(result.models)
+    } else {
+      setupStore.updateCheck('Ollama Service', {
+        status: 'pass',
+        message: 'Ollama connected',
+        details: 'No models installed yet'
       })
     }
   } catch (e) {
     setupStore.updateCheck('Ollama Service', {
-      status: 'fail',
+      status: 'warning',
       message: 'Ollama not available',
-      details: 'Make sure Ollama is installed and running'
+      details: 'Optional: Install from ollama.com'
     })
   }
 
-  // Available models
-  setupStore.updateCheck('Available Models', { status: 'checking' })
-  await new Promise(r => setTimeout(r, 300))
-  if (setupStore.installedModels.length > 0) {
-    setupStore.updateCheck('Available Models', {
-      status: 'pass',
-      message: `${setupStore.installedModels.length} model(s) ready`,
-      details: setupStore.installedModels.map(m => m.name).slice(0, 3).join(', ')
-    })
-  } else {
-    setupStore.updateCheck('Available Models', {
-      status: 'warning',
-      message: 'No models installed',
-      details: 'We\'ll help you install recommended models'
-    })
+  // Fetch all available models
+  try {
+    const models = await window.silo.models.list()
+    setupStore.setAllAvailableModels(models)
+  } catch (e) {
+    console.error('Failed to list models:', e)
   }
 
   // Storage access
@@ -118,9 +154,13 @@ async function runSystemChecks() {
 
 async function refreshModels() {
   try {
-    const models = await window.silo.ollama.listModels()
-    if (models && models.models) {
-      setupStore.setInstalledModels(models.models)
+    const models = await window.silo.models.list()
+    setupStore.setAllAvailableModels(models)
+
+    // Also refresh Ollama models for backwards compatibility
+    const result = await window.silo.ollama.listModels()
+    if (result.status !== 'error' && result.models) {
+      setupStore.setInstalledModels(result.models)
     }
   } catch (e) {
     console.error('Failed to refresh models:', e)
@@ -130,7 +170,7 @@ async function refreshModels() {
 async function pullModel(modelId: string) {
   setupStore.startPulling(modelId)
   try {
-    await window.silo.ollama.pullModel(modelId)
+    await window.silo.models.pull(modelId)
   } catch (e) {
     setupStore.completePulling(modelId)
     console.error('Failed to pull model:', e)
@@ -138,6 +178,13 @@ async function pullModel(modelId: string) {
 }
 
 function isModelInstalled(modelId: string): boolean {
+  // Check in unified model list
+  const model = setupStore.allAvailableModels.find(m =>
+    m.id === modelId || m.name === modelId
+  )
+  if (model?.isInstalled) return true
+
+  // Check in Ollama models (legacy)
   return setupStore.installedModels.some(m =>
     m.name === modelId || m.name.startsWith(modelId + ':')
   )
@@ -149,7 +196,7 @@ async function completeSetup() {
     defaultLanguageModel: setupStore.selectedModels.language,
     defaultVisionModel: setupStore.selectedModels.vision,
     setupComplete: true,
-    setupVersion: 1
+    setupVersion: 2 // Bump version for multi-backend
   })
 
   setupStore.hide()
@@ -171,14 +218,65 @@ const canProceed = computed(() => {
     return setupStore.allChecksPassed
   }
   if (setupStore.currentStep === 'model-select') {
+    // Can proceed if any model is selected and not currently pulling
     return setupStore.selectedModels.language !== '' && !setupStore.isPulling
   }
   return true
 })
 
-const recommendedLanguageModels = computed(() => {
-  return setupStore.hardwareInfo?.recommendations.models.language || []
+// Group models by provider for the selection UI
+const builtInLanguageModels = computed(() =>
+  setupStore.builtInModels.filter(m =>
+    m.capabilities.includes('chat') || m.capabilities.includes('generate')
+  )
+)
+
+const ollamaLanguageModels = computed(() => {
+  // Combine installed Ollama models with recommended ones
+  const installed = setupStore.installedModels.map(m => ({
+    id: `ollama:${m.name}`,
+    name: m.name,
+    size: formatSize(m.size),
+    speed: 'varies',
+    tier: getTierFromSize(m.size),
+    installed: true
+  }))
+
+  // Add recommended models from hardware info
+  const recommended = setupStore.hardwareInfo?.recommendations.models.language || []
+
+  // Merge, avoiding duplicates
+  const all = [...installed]
+  for (const rec of recommended) {
+    if (!all.find(m => m.name === rec.id || m.id === `ollama:${rec.id}`)) {
+      all.push({
+        id: `ollama:${rec.id}`,
+        name: rec.id,
+        size: rec.size,
+        speed: rec.speed,
+        tier: rec.tier,
+        installed: false
+      })
+    }
+  }
+
+  return all
 })
+
+function formatSize(bytes: number): string {
+  const gb = bytes / (1024 * 1024 * 1024)
+  if (gb >= 1) return `${gb.toFixed(1)}GB`
+  const mb = bytes / (1024 * 1024)
+  return `${Math.round(mb)}MB`
+}
+
+function getTierFromSize(bytes: number): string {
+  const gb = bytes / (1024 * 1024 * 1024)
+  if (gb > 20) return 'SURPLUS'
+  if (gb > 8) return 'HEAVY'
+  if (gb > 3) return 'STEADY'
+  return 'LEAN'
+}
 
 const recommendedVisionModels = computed(() => {
   return setupStore.hardwareInfo?.recommendations.models.vision || []
@@ -259,48 +357,108 @@ const recommendedVisionModels = computed(() => {
                 Your system is ready for {{ setupStore.hardwareInfo.tier.name }} tier models
               </p>
             </div>
+
+            <!-- Provider Summary -->
+            <div v-if="setupStore.hasAnyProvider" class="provider-summary">
+              <div class="provider-item" :class="{ available: setupStore.hasTransformers }">
+                <span class="provider-icon">{{ setupStore.hasTransformers ? '✓' : '○' }}</span>
+                <span class="provider-name">Built-in Models</span>
+                <span class="provider-status">{{ setupStore.hasTransformers ? 'Ready' : 'Loading' }}</span>
+              </div>
+              <div class="provider-item" :class="{ available: setupStore.hasOllama, optional: !setupStore.hasOllama }">
+                <span class="provider-icon">{{ setupStore.hasOllama ? '✓' : '!' }}</span>
+                <span class="provider-name">Ollama</span>
+                <span class="provider-status">{{ setupStore.hasOllama ? 'Connected' : 'Optional' }}</span>
+              </div>
+            </div>
           </div>
 
           <!-- Model Selection -->
           <div v-if="setupStore.currentStep === 'model-select'" class="setup-step">
-            <h3>Select Models</h3>
-            <p class="text-muted">Choose the AI models to stock your reserve. We've recommended models based on your hardware.</p>
+            <h3>Select Your AI Setup</h3>
+            <p class="text-muted">Choose how you want to use AI. You can always change this later.</p>
 
+            <!-- Built-in Models Section -->
             <div class="model-section">
-              <h4>Language Model <span class="label">Required</span></h4>
-              <p class="section-hint text-muted">Models marked with [R] are recommended for your hardware tier</p>
+              <div class="section-header">
+                <h4>Built-in Models <span class="label label-success">Works Now</span></h4>
+                <p class="section-hint text-muted">Fast, lightweight models that run without additional setup</p>
+              </div>
               <div class="model-grid">
                 <button
-                  v-for="model in recommendedLanguageModels"
+                  v-for="model in builtInLanguageModels"
                   :key="model.id"
-                  :class="['model-option', { selected: setupStore.selectedModels.language === model.id, installed: isModelInstalled(model.id), recommended: model.recommended }]"
+                  :class="['model-option', { selected: setupStore.selectedModels.language === model.id }]"
                   @click="setupStore.selectModel('language', model.id)"
                 >
                   <span class="model-header">
-                    <span class="model-name">{{ model.id }}</span>
-                    <span v-if="model.recommended" class="model-recommended">[R]</span>
+                    <span class="model-name">{{ model.name }}</span>
+                  </span>
+                  <span class="model-meta">{{ model.sizeLabel }} • Fast</span>
+                  <span class="model-description">{{ model.description }}</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Ollama Models Section -->
+            <div v-if="setupStore.hasOllama || ollamaLanguageModels.length > 0" class="model-section">
+              <div class="section-header">
+                <h4>
+                  Ollama Models
+                  <span v-if="setupStore.hasOllama" class="label label-info">Connected</span>
+                  <span v-else class="label label-warning">Requires Install</span>
+                </h4>
+                <p class="section-hint text-muted">Larger, more capable models. [R] = Recommended for your hardware</p>
+              </div>
+              <div class="model-grid">
+                <button
+                  v-for="model in ollamaLanguageModels"
+                  :key="model.id"
+                  :class="['model-option', {
+                    selected: setupStore.selectedModels.language === model.id,
+                    installed: model.installed,
+                    disabled: !setupStore.hasOllama && !model.installed
+                  }]"
+                  :disabled="!setupStore.hasOllama && !model.installed"
+                  @click="setupStore.selectModel('language', model.id)"
+                >
+                  <span class="model-header">
+                    <span class="model-name">{{ model.name }}</span>
+                    <span v-if="setupStore.hardwareInfo?.recommendations.models.language.find(r => r.id === model.name)?.recommended" class="model-recommended">[R]</span>
                   </span>
                   <span class="model-meta">{{ model.size }} • {{ model.speed }}</span>
                   <span class="model-tier">{{ model.tier }}</span>
-                  <span v-if="isModelInstalled(model.id)" class="model-installed">Installed</span>
+                  <span v-if="model.installed" class="model-installed">Installed</span>
                   <span v-else-if="setupStore.pullingModels.has(model.id)" class="model-progress">
                     {{ Math.round(setupStore.pullProgress[model.id] || 0) }}%
                   </span>
                 </button>
               </div>
+
+              <!-- Download button for Ollama models -->
               <button
-                v-if="setupStore.selectedModels.language && !isModelInstalled(setupStore.selectedModels.language)"
+                v-if="setupStore.selectedModels.language.startsWith('ollama:') && !isModelInstalled(setupStore.selectedModels.language)"
                 class="btn btn-secondary btn-sm"
-                :disabled="setupStore.pullingModels.has(setupStore.selectedModels.language)"
+                :disabled="setupStore.pullingModels.has(setupStore.selectedModels.language) || !setupStore.hasOllama"
                 @click="pullModel(setupStore.selectedModels.language)"
               >
                 {{ setupStore.pullingModels.has(setupStore.selectedModels.language) ? 'Downloading...' : 'Download Selected Model' }}
               </button>
+
+              <!-- Install Ollama hint -->
+              <div v-if="!setupStore.hasOllama" class="ollama-hint">
+                <p class="text-subtle">
+                  Want more powerful models?
+                  <a href="https://ollama.com" target="_blank" rel="noopener">Install Ollama</a>
+                  to access 7B+ parameter models.
+                </p>
+              </div>
             </div>
 
-            <div class="model-section">
+            <!-- Vision Models (Optional) -->
+            <div v-if="recommendedVisionModels.length > 0 && setupStore.hasOllama" class="model-section">
               <h4>Vision Model <span class="label">Optional</span></h4>
-              <p class="section-hint text-muted">Models marked with [R] are recommended for your hardware tier</p>
+              <p class="section-hint text-muted">For image understanding capabilities</p>
               <div class="model-grid">
                 <button
                   v-for="model in recommendedVisionModels"
@@ -324,7 +482,7 @@ const recommendedVisionModels = computed(() => {
                 v-if="setupStore.selectedModels.vision && !isModelInstalled(setupStore.selectedModels.vision)"
                 class="btn btn-secondary btn-sm"
                 :disabled="setupStore.pullingModels.has(setupStore.selectedModels.vision)"
-                @click="pullModel(setupStore.selectedModels.vision)"
+                @click="pullModel(`ollama:${setupStore.selectedModels.vision}`)"
               >
                 {{ setupStore.pullingModels.has(setupStore.selectedModels.vision) ? 'Downloading...' : 'Download Selected Model' }}
               </button>
@@ -343,12 +501,16 @@ const recommendedVisionModels = computed(() => {
                 <span class="value">{{ setupStore.hardwareInfo?.tier.name }}</span>
               </div>
               <div class="summary-item">
+                <span class="label">AI Backend</span>
+                <span class="value">{{ setupStore.selectedModels.provider === 'transformers' ? 'Built-in' : 'Ollama' }}</span>
+              </div>
+              <div class="summary-item">
                 <span class="label">Language Model</span>
                 <span class="value">{{ setupStore.selectedModels.language || 'Not selected' }}</span>
               </div>
-              <div class="summary-item">
+              <div v-if="setupStore.selectedModels.vision" class="summary-item">
                 <span class="label">Vision Model</span>
-                <span class="value">{{ setupStore.selectedModels.vision || 'Not selected' }}</span>
+                <span class="value">{{ setupStore.selectedModels.vision }}</span>
               </div>
             </div>
           </div>
@@ -370,7 +532,7 @@ const recommendedVisionModels = computed(() => {
             :disabled="!canProceed"
             @click="setupStore.nextStep"
           >
-            Continue
+            {{ setupStore.currentStep === 'system-check' && setupStore.hasAnyProvider ? 'Continue' : 'Continue' }}
           </button>
           <button
             v-else
@@ -401,7 +563,7 @@ const recommendedVisionModels = computed(() => {
   background: var(--color-surface);
   border: var(--border-width-2) solid var(--color-border);
   width: 100%;
-  max-width: 560px;
+  max-width: 600px;
   max-height: 90vh;
   display: flex;
   flex-direction: column;
@@ -562,7 +724,7 @@ const recommendedVisionModels = computed(() => {
 }
 
 .hardware-summary {
-  margin-top: var(--space-6);
+  margin-top: var(--space-4);
   padding: var(--space-4);
   background: var(--color-surface-raised);
   border: var(--border-width) solid var(--color-border);
@@ -578,15 +740,62 @@ const recommendedVisionModels = computed(() => {
   margin-bottom: var(--space-2);
 }
 
+.provider-summary {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+  justify-content: center;
+}
+
+.provider-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-raised);
+  border: var(--border-width) solid var(--color-border);
+  font-size: var(--text-sm);
+}
+
+.provider-item.available {
+  border-color: var(--color-success);
+}
+
+.provider-item.optional {
+  border-color: var(--color-warning);
+  opacity: 0.8;
+}
+
+.provider-icon {
+  font-weight: var(--weight-bold);
+}
+
+.provider-item.available .provider-icon {
+  color: var(--color-success);
+}
+
+.provider-item.optional .provider-icon {
+  color: var(--color-warning);
+}
+
+.provider-status {
+  color: var(--color-text-subtle);
+  font-size: var(--text-xs);
+}
+
 .model-section {
   text-align: left;
   margin-bottom: var(--space-6);
 }
 
+.section-header {
+  margin-bottom: var(--space-3);
+}
+
 .model-section h4 {
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  margin-bottom: var(--space-2);
+  margin-bottom: var(--space-1);
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -616,7 +825,7 @@ const recommendedVisionModels = computed(() => {
   text-align: left;
 }
 
-.model-option:hover {
+.model-option:hover:not(:disabled) {
   border-color: var(--color-border-strong);
 }
 
@@ -625,12 +834,9 @@ const recommendedVisionModels = computed(() => {
   background: var(--color-accent-glow);
 }
 
-.model-option.recommended {
-  border-color: var(--color-success);
-}
-
-.model-option.recommended.selected {
-  border-color: var(--color-accent);
+.model-option.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .model-option.installed {
@@ -667,6 +873,12 @@ const recommendedVisionModels = computed(() => {
   color: var(--color-text-subtle);
 }
 
+.model-description {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  margin-top: var(--space-1);
+}
+
 .model-installed {
   font-size: var(--text-xs);
   color: var(--color-success);
@@ -677,6 +889,19 @@ const recommendedVisionModels = computed(() => {
   font-size: var(--text-xs);
   color: var(--color-accent);
   margin-top: var(--space-1);
+}
+
+.ollama-hint {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  font-size: var(--text-sm);
+}
+
+.ollama-hint a {
+  color: var(--color-accent);
+  text-decoration: underline;
 }
 
 .setup-summary {
@@ -712,5 +937,33 @@ const recommendedVisionModels = computed(() => {
 
 .spacer {
   flex: 1;
+}
+
+.label {
+  font-size: var(--text-xs);
+  padding: var(--space-1) var(--space-2);
+  border: var(--border-width) solid var(--color-border);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+}
+
+.label-success {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}
+
+.label-info {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.label-warning {
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 </style>

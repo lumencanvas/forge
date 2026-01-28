@@ -149,6 +149,8 @@ function getTierClass(tierName: string): string {
   align-items: center;
   justify-content: space-between;
   padding: var(--space-4) var(--space-6);
+  /* Account for macOS traffic light buttons */
+  padding-left: 80px;
   border-bottom: var(--border-width-2) solid var(--color-border);
   background: var(--color-surface);
 }

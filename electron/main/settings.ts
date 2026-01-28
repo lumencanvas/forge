@@ -7,6 +7,12 @@ import { app } from 'electron'
 import { join } from 'path'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
 
+// Task types for default model configuration
+export type TaskType =
+  | 'chat' | 'generate' | 'summarize' | 'translate' | 'question-answering'
+  | 'image-classification' | 'object-detection' | 'depth-estimation' | 'image-to-text'
+  | 'speech-to-text' | 'audio-classification' | 'embed' | 'text-to-image'
+
 export interface AppSettings {
   // General
   theme: 'dark' | 'light' | 'system'
@@ -16,6 +22,12 @@ export interface AppSettings {
   defaultLanguageModel: string
   defaultVisionModel: string
   defaultAudioModel: string
+
+  // API Keys
+  huggingfaceApiKey?: string
+
+  // Default models by task (optional overrides)
+  defaultModelsByTask?: Partial<Record<TaskType, string>>
 
   // Chat
   sendOnEnter: boolean

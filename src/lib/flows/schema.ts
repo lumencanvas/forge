@@ -3,7 +3,33 @@
  * Type definitions for pipeline/workflow definitions
  */
 
+// Import task and provider types
+export type ProviderType = 'ollama' | 'transformers' | 'huggingface'
+
+export type TaskType =
+  | 'chat'
+  | 'generate'
+  | 'summarize'
+  | 'translate'
+  | 'question-answering'
+  | 'zero-shot-classification'
+  | 'text-classification'
+  | 'token-classification'
+  | 'image-classification'
+  | 'object-detection'
+  | 'image-segmentation'
+  | 'depth-estimation'
+  | 'image-to-text'
+  | 'speech-to-text'
+  | 'text-to-speech'
+  | 'audio-classification'
+  | 'embed'
+  | 'text-to-image'
+  | 'classify'
+
+// Legacy model type (for backwards compatibility)
 export type ModelType = 'language' | 'vision' | 'audio'
+
 export type PipelineCategory = 'builtin' | 'custom'
 export type InputType = 'text' | 'textarea' | 'file' | 'select' | 'toggle'
 export type OutputFormat = 'chat' | 'markdown' | 'json'
@@ -56,8 +82,32 @@ export interface PipelineStep {
   name: string
   /** Human-readable description */
   description?: string
-  /** Model type required */
-  model: ModelType
+
+  /**
+   * Task to perform (NEW - preferred)
+   * If specified, this takes precedence over 'model' field
+   */
+  task?: TaskType
+
+  /**
+   * Model type (LEGACY - for backwards compatibility)
+   * Use 'task' field instead for new pipelines
+   */
+  model?: ModelType
+
+  /**
+   * Specific model ID (optional)
+   * e.g., "transformers:whisper-tiny.en" or "ollama:llama3.2:3b"
+   * If not specified, uses system default for the task
+   */
+  modelId?: string
+
+  /**
+   * Preferred provider (optional)
+   * If not specified, uses best available
+   */
+  provider?: ProviderType
+
   /** Input variable reference (e.g., "$image" or "$previous_output") */
   input: string
   /** System/instruction prompt */
@@ -114,6 +164,75 @@ export interface PipelineContext {
 }
 
 /**
+ * Maps legacy ModelType to modern TaskType
+ */
+export function modelTypeToTaskType(modelType: ModelType): TaskType {
+  switch (modelType) {
+    case 'language':
+      return 'chat'
+    case 'vision':
+      return 'image-to-text'
+    case 'audio':
+      return 'speech-to-text'
+    default:
+      return 'chat'
+  }
+}
+
+/**
+ * Gets the effective task type from a step
+ */
+export function getStepTaskType(step: PipelineStep): TaskType {
+  if (step.task) {
+    return step.task
+  }
+  if (step.model) {
+    return modelTypeToTaskType(step.model)
+  }
+  return 'chat'
+}
+
+/**
+ * Checks if a task is a vision task
+ */
+export function isVisionTask(task: TaskType): boolean {
+  return [
+    'image-classification',
+    'object-detection',
+    'image-segmentation',
+    'depth-estimation',
+    'image-to-text'
+  ].includes(task)
+}
+
+/**
+ * Checks if a task is an audio task
+ */
+export function isAudioTask(task: TaskType): boolean {
+  return [
+    'speech-to-text',
+    'text-to-speech',
+    'audio-classification'
+  ].includes(task)
+}
+
+/**
+ * Checks if a task is a text generation task
+ */
+export function isTextTask(task: TaskType): boolean {
+  return [
+    'chat',
+    'generate',
+    'summarize',
+    'translate',
+    'question-answering',
+    'text-classification',
+    'zero-shot-classification',
+    'token-classification'
+  ].includes(task)
+}
+
+/**
  * Validates a pipeline definition
  */
 export function validatePipeline(pipeline: Partial<Pipeline>): { valid: boolean; errors: string[] } {
@@ -144,6 +263,11 @@ export function validatePipeline(pipeline: Partial<Pipeline>): { valid: boolean;
 
       if (!step.output?.trim()) {
         errors.push(`Step ${i + 1}: output variable name is required`)
+      }
+
+      // Validate task or model is specified
+      if (!step.task && !step.model) {
+        errors.push(`Step ${i + 1}: either 'task' or 'model' must be specified`)
       }
 
       // Check input reference
@@ -213,8 +337,11 @@ export function createSimplePipeline(
   description: string,
   inputLabel: string,
   systemPrompt: string,
-  modelType: ModelType = 'language'
+  taskType: TaskType = 'chat'
 ): Pipeline {
+  const isVision = isVisionTask(taskType)
+  const isAudio = isAudioTask(taskType)
+
   return {
     id: `custom-${Date.now()}`,
     name,
@@ -224,17 +351,17 @@ export function createSimplePipeline(
     inputs: [
       {
         name: 'input',
-        type: modelType === 'vision' ? 'file' : 'textarea',
+        type: isVision ? 'file' : isAudio ? 'file' : 'textarea',
         label: inputLabel,
-        placeholder: 'Enter your input...',
+        placeholder: isVision ? 'Select an image...' : isAudio ? 'Select an audio file...' : 'Enter your input...',
         required: true,
-        accepts: modelType === 'vision' ? ['image/*'] : undefined
+        accepts: isVision ? ['image/*'] : isAudio ? ['audio/*'] : undefined
       }
     ],
     steps: [
       {
         name: 'process',
-        model: modelType,
+        task: taskType,
         input: '$input',
         prompt: systemPrompt,
         output: 'result'

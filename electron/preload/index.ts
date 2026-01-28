@@ -43,6 +43,233 @@ export interface OllamaStatusInfo {
   isReady: boolean
 }
 
+// Model Provider Types
+export type ProviderType = 'ollama' | 'transformers' | 'huggingface'
+
+export type TaskType =
+  | 'chat'
+  | 'generate'
+  | 'summarize'
+  | 'translate'
+  | 'question-answering'
+  | 'zero-shot-classification'
+  | 'text-classification'
+  | 'token-classification'
+  | 'image-classification'
+  | 'object-detection'
+  | 'image-segmentation'
+  | 'depth-estimation'
+  | 'image-to-text'
+  | 'speech-to-text'
+  | 'text-to-speech'
+  | 'audio-classification'
+  | 'embed'
+  | 'text-to-image'
+  | 'classify'
+
+export type HardwareTier = 'LEAN' | 'STEADY' | 'HEAVY' | 'SURPLUS'
+
+export interface ModelInfo {
+  id: string
+  name: string
+  provider: ProviderType
+  size: number
+  sizeLabel: string
+  capabilities: TaskType[]
+  tier: HardwareTier
+  isLocal: boolean
+  isInstalled: boolean
+  description?: string
+  huggingFaceId?: string
+}
+
+export interface ProviderStatus {
+  type: ProviderType
+  name: string
+  status: 'available' | 'unavailable' | 'checking' | 'downloading'
+  error?: string
+  models: ModelInfo[]
+  downloadProgress?: number
+}
+
+export interface AllProvidersStatus {
+  providers: ProviderStatus[]
+  hasAvailableProvider: boolean
+  recommendedProvider: ProviderType | null
+}
+
+export interface ModelChatRequest {
+  messages: ChatMessage[]
+  model?: string
+  preferredProvider?: ProviderType
+}
+
+export interface ModelChatResponse {
+  model: string
+  provider: ProviderType
+  message: ChatMessage
+  done: boolean
+  totalDuration?: number
+  evalCount?: number
+}
+
+export interface ModelGenerateOptions {
+  prompt: string
+  model?: string
+  preferredProvider?: ProviderType
+  images?: string[]
+  maxTokens?: number
+  temperature?: number
+}
+
+export interface ModelGenerateResponse {
+  model: string
+  provider: ProviderType
+  response: string
+  done: boolean
+  totalDuration?: number
+}
+
+export interface ModelEmbedOptions {
+  text: string | string[]
+  model?: string
+  preferredProvider?: ProviderType
+}
+
+export interface ModelEmbedResponse {
+  model: string
+  provider: ProviderType
+  embeddings: number[][]
+}
+
+// Vision types
+export interface VisionOptions {
+  image: string
+  model?: string
+  preferredProvider?: ProviderType
+  task: 'image-classification' | 'object-detection' | 'image-segmentation' | 'depth-estimation' | 'image-to-text'
+}
+
+export interface ImageClassificationResult {
+  label: string
+  score: number
+}
+
+export interface ObjectDetectionResult {
+  label: string
+  score: number
+  box: { xmin: number; ymin: number; xmax: number; ymax: number }
+}
+
+export interface VisionResponse {
+  model: string
+  provider: ProviderType
+  task: string
+  results: ImageClassificationResult[] | ObjectDetectionResult[] | string | unknown
+}
+
+// Audio types
+export interface AudioOptions {
+  audio: ArrayBuffer | string
+  model?: string
+  preferredProvider?: ProviderType
+  task: 'speech-to-text' | 'audio-classification'
+}
+
+export interface SpeechToTextResult {
+  text: string
+  chunks?: Array<{ text: string; timestamp: [number, number] }>
+}
+
+export interface AudioResponse {
+  model: string
+  provider: ProviderType
+  task: string
+  result: SpeechToTextResult | unknown
+}
+
+// Image generation types
+export interface ImageGenOptions {
+  prompt: string
+  model?: string
+  preferredProvider?: ProviderType
+  negativePrompt?: string
+  width?: number
+  height?: number
+  steps?: number
+}
+
+export interface ImageGenResponse {
+  model: string
+  provider: ProviderType
+  image: string
+}
+
+export interface ModelPullProgress {
+  model: string
+  provider: ProviderType
+  progress: number
+  status: 'downloading' | 'verifying' | 'complete' | 'error'
+  error?: string
+}
+
+// System stats types
+export interface SystemStats {
+  cpu: {
+    usage: number
+    temperature?: number
+  }
+  memory: {
+    total: number
+    used: number
+    free: number
+  }
+  gpu?: {
+    usage: number
+    memory: number
+    memoryTotal?: number
+    temperature?: number
+    name?: string
+  }
+}
+
+export interface LoadedModel {
+  id: string
+  provider: ProviderType
+  loadedAt: number
+  lastUsed: number
+  memoryUsage: number
+}
+
+export interface ModelRegistryEntry {
+  id: string
+  name: string
+  provider: ProviderType
+  huggingFaceId?: string
+  tasks: TaskType[]
+  pipelineType?: string
+  sizeBytes?: number
+  sizeLabel?: string
+  tier: HardwareTier
+  isBuiltIn: boolean
+  description?: string
+}
+
+export interface CustomModelConfig {
+  huggingFaceId: string
+  name: string
+  tasks: TaskType[]
+  pipelineType?: string
+  provider: 'transformers' | 'huggingface'
+}
+
+export interface ModelStatus {
+  exists: boolean
+  isDownloaded: boolean
+  isLoaded: boolean
+  memoryUsage?: number
+}
+
 // Settings types
 export interface AppSettings {
   theme: 'dark' | 'light' | 'system'
@@ -58,6 +285,8 @@ export interface AppSettings {
   telemetryEnabled: boolean
   setupComplete: boolean
   setupVersion: number
+  huggingfaceApiKey?: string
+  defaultModelsByTask?: Record<TaskType, string>
 }
 
 export interface StoredChatMessage {
@@ -91,7 +320,116 @@ const siloAPI = {
     }
   },
 
-  // Ollama
+  // ============================================
+  // Unified Model Provider API
+  // ============================================
+  models: {
+    // Get status of all providers
+    getStatus: (): Promise<AllProvidersStatus> => ipcRenderer.invoke('models:status'),
+
+    // List all models from all providers
+    list: (): Promise<ModelInfo[]> => ipcRenderer.invoke('models:list'),
+
+    // Unified chat
+    chat: (request: ModelChatRequest): Promise<ModelChatResponse> =>
+      ipcRenderer.invoke('models:chat', request),
+
+    // Unified generate
+    generate: (options: ModelGenerateOptions): Promise<ModelGenerateResponse> =>
+      ipcRenderer.invoke('models:generate', options),
+
+    // Unified embeddings
+    embed: (options: ModelEmbedOptions): Promise<ModelEmbedResponse> =>
+      ipcRenderer.invoke('models:embed', options),
+
+    // Vision tasks (image classification, object detection, etc.)
+    vision: (options: VisionOptions): Promise<VisionResponse> =>
+      ipcRenderer.invoke('models:vision', options),
+
+    // Audio tasks (speech-to-text, etc.)
+    audio: (options: AudioOptions): Promise<AudioResponse> =>
+      ipcRenderer.invoke('models:audio', options),
+
+    // Image generation
+    imageGen: (options: ImageGenOptions): Promise<ImageGenResponse> =>
+      ipcRenderer.invoke('models:image-gen', options),
+
+    // Pull/download a model
+    pull: (modelId: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('models:pull', modelId),
+
+    // Get recommended model for a task
+    recommend: (task: TaskType, preferredProvider?: ProviderType): Promise<ModelInfo | null> =>
+      ipcRenderer.invoke('models:recommend', task, preferredProvider),
+
+    // Refresh provider status
+    refresh: (): Promise<AllProvidersStatus> => ipcRenderer.invoke('models:refresh'),
+
+    // Get model status (downloaded, loaded, etc.)
+    getModelStatus: (modelId: string): Promise<ModelStatus> =>
+      ipcRenderer.invoke('models:get-status', modelId),
+
+    // Delete a model
+    deleteModel: (modelId: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('models:delete', modelId),
+
+    // Load a model into memory
+    loadModel: (modelId: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('models:load', modelId),
+
+    // Unload a model from memory
+    unloadModel: (modelId: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('models:unload', modelId),
+
+    // Get loaded models
+    getLoadedModels: (): Promise<LoadedModel[]> =>
+      ipcRenderer.invoke('models:loaded'),
+
+    // Get model registry
+    getRegistry: (): Promise<ModelRegistryEntry[]> =>
+      ipcRenderer.invoke('models:registry'),
+
+    // Get models for a specific task
+    getModelsForTask: (task: TaskType): Promise<ModelInfo[]> =>
+      ipcRenderer.invoke('models:for-task', task),
+
+    // Add custom model
+    addCustomModel: (config: CustomModelConfig): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('models:add-custom', config),
+
+    // Listen for provider status changes
+    onStatusChange: (callback: (status: AllProvidersStatus) => void) => {
+      const handler = (_: unknown, data: AllProvidersStatus) => callback(data)
+      ipcRenderer.on('models:status', handler)
+      return () => ipcRenderer.removeListener('models:status', handler)
+    },
+
+    // Listen for pull progress
+    onPullProgress: (callback: (progress: ModelPullProgress) => void) => {
+      const handler = (_: unknown, data: ModelPullProgress) => callback(data)
+      ipcRenderer.on('models:pull-progress', handler)
+      return () => ipcRenderer.removeListener('models:pull-progress', handler)
+    }
+  },
+
+  // ============================================
+  // System Stats API
+  // ============================================
+  system: {
+    // Get current system stats (CPU, GPU, RAM)
+    getStats: (): Promise<SystemStats> => ipcRenderer.invoke('system:stats'),
+
+    // Listen for system stats updates (if implemented)
+    onStatsUpdate: (callback: (stats: SystemStats) => void) => {
+      const handler = (_: unknown, data: SystemStats) => callback(data)
+      ipcRenderer.on('system:stats-update', handler)
+      return () => ipcRenderer.removeListener('system:stats-update', handler)
+    }
+  },
+
+  // ============================================
+  // LEGACY: Ollama API (for backwards compatibility)
+  // ============================================
   ollama: {
     getStatus: (): Promise<OllamaStatusInfo> => ipcRenderer.invoke('ollama:status'),
     checkConnection: (): Promise<OllamaStatusInfo> => ipcRenderer.invoke('ollama:check-connection'),

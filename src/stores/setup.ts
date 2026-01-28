@@ -1,11 +1,17 @@
 /**
  * SILO - Setup Store
- * Manages first-run setup wizard state
+ * Manages first-run setup wizard state with multi-backend support
  */
 
 import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
-import type { HardwareInfo, OllamaModel } from '../../electron/preload/index.d'
+import type {
+  HardwareInfo,
+  OllamaModel,
+  ProviderType,
+  ModelInfo,
+  AllProvidersStatus
+} from '../../electron/preload/index.d'
 
 export type SetupStep = 'welcome' | 'system-check' | 'model-select' | 'complete'
 
@@ -20,11 +26,11 @@ export const useSetupStore = defineStore('setup', () => {
   const currentStep = ref<SetupStep>('welcome')
   const isVisible = ref(false)
 
-  // System checks
+  // System checks - updated for multi-backend
   const checks = ref<SystemCheck[]>([
     { name: 'Hardware Detection', status: 'pending', message: 'Detecting hardware capabilities...' },
+    { name: 'Built-in Models', status: 'pending', message: 'Checking built-in AI models...' },
     { name: 'Ollama Service', status: 'pending', message: 'Checking Ollama installation...' },
-    { name: 'Available Models', status: 'pending', message: 'Scanning for installed models...' },
     { name: 'Storage Access', status: 'pending', message: 'Verifying storage permissions...' }
   ])
 
@@ -33,35 +39,68 @@ export const useSetupStore = defineStore('setup', () => {
   const installedModels = ref<OllamaModel[]>([])
   const recommendedModels = ref<string[]>([])
 
+  // Provider status
+  const providersStatus = ref<AllProvidersStatus | null>(null)
+  const allAvailableModels = ref<ModelInfo[]>([])
+
   // Model selection during setup
   const selectedModels = ref<{
     language: string
     vision: string
+    provider: ProviderType
   }>({
     language: '',
-    vision: ''
+    vision: '',
+    provider: 'transformers' // Default to built-in models
   })
 
   // Model pulling state
   const pullingModels = ref<Set<string>>(new Set())
   const pullProgress = ref<Record<string, number>>({})
 
-  // Computed
-  const allChecksPassed = computed(() =>
-    checks.value.every(c => c.status === 'pass' || c.status === 'warning')
+  // Computed - updated for multi-backend
+  const allChecksPassed = computed(() => {
+    // Must pass: Hardware Detection, Built-in Models, Storage Access
+    // Optional: Ollama Service (warning is OK)
+    return checks.value.every(c => {
+      if (c.name === 'Ollama Service') {
+        // Ollama is optional - warning or pass is fine
+        return c.status === 'pass' || c.status === 'warning'
+      }
+      return c.status === 'pass' || c.status === 'warning'
+    })
+  })
+
+  const hasAnyProvider = computed(() =>
+    providersStatus.value?.hasAvailableProvider ?? false
   )
 
+  const hasOllama = computed(() => {
+    const ollama = providersStatus.value?.providers.find(p => p.type === 'ollama')
+    return ollama?.status === 'available'
+  })
+
+  const hasTransformers = computed(() => {
+    const transformers = providersStatus.value?.providers.find(p => p.type === 'transformers')
+    return transformers?.status === 'available'
+  })
+
   const hasMinimumModels = computed(() => {
-    const models = installedModels.value.map(m => m.name)
-    return models.some(m =>
-      m.includes('llama') ||
-      m.includes('mistral') ||
-      m.includes('phi') ||
-      m.includes('qwen')
-    )
+    // Has models from any provider
+    return allAvailableModels.value.length > 0 || installedModels.value.length > 0
   })
 
   const isPulling = computed(() => pullingModels.value.size > 0)
+
+  // Built-in models (Transformers.js) - these are always available
+  const builtInModels = computed(() =>
+    allAvailableModels.value.filter(m => m.provider === 'transformers')
+  )
+
+  // Ollama models
+  const ollamaModels = computed(() =>
+    allAvailableModels.value.filter(m => m.provider === 'ollama')
+  )
 
   // Actions
   function show(): void {
@@ -109,13 +148,31 @@ export const useSetupStore = defineStore('setup', () => {
       ...recs.vision.map(m => m.id)
     ]
 
-    // Pre-select first recommended models
-    if (recs.language.length > 0) {
+    // Pre-select first recommended models (prefer built-in initially)
+    if (hasTransformers.value && builtInModels.value.length > 0) {
+      const builtInLanguage = builtInModels.value.find(m =>
+        m.capabilities.includes('chat') || m.capabilities.includes('generate')
+      )
+      if (builtInLanguage) {
+        selectedModels.value.language = builtInLanguage.id
+        selectedModels.value.provider = 'transformers'
+      }
+    } else if (recs.language.length > 0) {
       selectedModels.value.language = recs.language[0]!.id
+      selectedModels.value.provider = 'ollama'
     }
+
     if (recs.vision.length > 0) {
       selectedModels.value.vision = recs.vision[0]!.id
     }
+  }
+
+  function setProvidersStatus(status: AllProvidersStatus): void {
+    providersStatus.value = status
+  }
+
+  function setAllAvailableModels(models: ModelInfo[]): void {
+    allAvailableModels.value = models
   }
 
   function setInstalledModels(models: OllamaModel[]): void {
@@ -126,6 +183,25 @@ export const useSetupStore = defineStore('setup', () => {
     selectedModels.value = {
       ...selectedModels.value,
       [type]: modelId
+    }
+
+    // Update provider based on selected model
+    const model = allAvailableModels.value.find(m => m.id === modelId)
+    if (model) {
+      selectedModels.value.provider = model.provider
+    }
+  }
+
+  function selectProvider(provider: ProviderType): void {
+    selectedModels.value.provider = provider
+
+    // Auto-select best model from this provider
+    const providerModels = allAvailableModels.value.filter(m => m.provider === provider)
+    const languageModel = providerModels.find(m =>
+      m.capabilities.includes('chat') || m.capabilities.includes('generate')
+    )
+    if (languageModel) {
+      selectedModels.value.language = languageModel.id
     }
   }
 
@@ -149,7 +225,9 @@ export const useSetupStore = defineStore('setup', () => {
     checks.value = checks.value.map(c => ({ ...c, status: 'pending' }))
     hardwareInfo.value = null
     installedModels.value = []
-    selectedModels.value = { language: '', vision: '' }
+    providersStatus.value = null
+    allAvailableModels.value = []
+    selectedModels.value = { language: '', vision: '', provider: 'transformers' }
     pullingModels.value = new Set()
     pullProgress.value = {}
   }
@@ -161,12 +239,19 @@ export const useSetupStore = defineStore('setup', () => {
     hardwareInfo,
     installedModels,
     recommendedModels,
+    providersStatus,
+    allAvailableModels,
     selectedModels,
     pullingModels,
     pullProgress,
     allChecksPassed,
+    hasAnyProvider,
+    hasOllama,
+    hasTransformers,
     hasMinimumModels,
     isPulling,
+    builtInModels,
+    ollamaModels,
     show,
     hide,
     nextStep,
@@ -174,8 +259,11 @@ export const useSetupStore = defineStore('setup', () => {
     goToStep,
     updateCheck,
     setHardwareInfo,
+    setProvidersStatus,
+    setAllAvailableModels,
     setInstalledModels,
     selectModel,
+    selectProvider,
     startPulling,
     updatePullProgress,
     completePulling,

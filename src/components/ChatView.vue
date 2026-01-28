@@ -4,7 +4,7 @@ import { useChatsStore } from '@/stores/chats'
 import { useSettingsStore } from '@/stores/settings'
 import { useFlowsStore } from '@/stores/flows'
 import { useHardwareStore } from '@/stores/hardware'
-import type { OllamaModel } from '../../electron/preload/index.d'
+import type { ModelInfo, ModelPullProgress } from '../../electron/preload/index.d'
 
 import ChatSidebar from '@/components/chat/ChatSidebar.vue'
 import ChatMessageComponent from '@/components/chat/ChatMessage.vue'
@@ -28,13 +28,19 @@ const settingsStore = useSettingsStore()
 const flowsStore = useFlowsStore()
 const hardwareStore = useHardwareStore()
 
-const models = ref<OllamaModel[]>([])
+const models = ref<ModelInfo[]>([])
 const selectedModel = ref('')
 const sidebarCollapsed = ref(false)
 const messagesRef = ref<HTMLDivElement | null>(null)
 const inputRef = ref<InstanceType<typeof ChatInput> | null>(null)
 const isStreaming = ref(false)
 const streamingMessageId = ref<string | null>(null)
+const isDownloading = ref(false)
+const downloadProgress = ref<ModelPullProgress | null>(null)
+const modelError = ref<string | null>(null)
+
+// Cleanup functions for event listeners
+let cleanupPullProgress: (() => void) | undefined
 
 // Pipeline-specific state
 const currentPipeline = computed(() => {
@@ -61,18 +67,44 @@ const chatIcon = computed(() => {
 // Load models
 onMounted(async () => {
   try {
-    const result = await window.silo.ollama.listModels()
-    models.value = result?.models || []
+    // Use unified models API
+    const modelList = await window.silo.models.list()
+    // Filter to models that support chat
+    models.value = modelList.filter(m =>
+      m.capabilities.includes('chat') || m.capabilities.includes('generate')
+    )
 
-    // Set default model
+    // Set default model - prefer installed models
+    const installedModels = models.value.filter(m => m.isInstalled)
     if (settingsStore.defaultLanguageModel) {
       selectedModel.value = settingsStore.defaultLanguageModel
+    } else if (installedModels.length > 0) {
+      selectedModel.value = installedModels[0]!.id
     } else if (models.value.length > 0) {
-      selectedModel.value = models.value[0]!.name
+      // Fallback to first available (will need download)
+      selectedModel.value = models.value[0]!.id
     }
   } catch (e) {
     console.error('Failed to load models:', e)
+    modelError.value = 'Failed to load models'
   }
+
+  // Listen for pull progress
+  cleanupPullProgress = window.silo.models.onPullProgress((progress) => {
+    downloadProgress.value = progress
+    if (progress.status === 'complete') {
+      isDownloading.value = false
+      // Refresh model list
+      window.silo.models.list().then(list => {
+        models.value = list.filter(m =>
+          m.capabilities.includes('chat') || m.capabilities.includes('generate')
+        )
+      })
+    } else if (progress.status === 'error') {
+      isDownloading.value = false
+      modelError.value = progress.error || 'Download failed'
+    }
+  })
 
   // Load chats
   await chatsStore.loadChats()
@@ -96,6 +128,10 @@ onMounted(async () => {
   }
 })
 
+onUnmounted(() => {
+  cleanupPullProgress?.()
+})
+
 // Scroll to bottom when messages change
 watch(() => chatsStore.currentMessages, () => {
   nextTick(() => {
@@ -111,7 +147,28 @@ watch(selectedModel, (newModel) => {
 })
 
 async function sendMessage(content: string, images?: string[]) {
-  if (!selectedModel.value || isStreaming.value) return
+  if (!selectedModel.value || isStreaming.value || isDownloading.value) return
+
+  modelError.value = null
+
+  // Check if model is ready (installed/available)
+  const model = models.value.find(m => m.id === selectedModel.value)
+  if (model && !model.isInstalled && model.isLocal) {
+    // Need to download the model first
+    isDownloading.value = true
+    try {
+      const result = await window.silo.models.pull(selectedModel.value)
+      if (!result.success) {
+        modelError.value = result.error || 'Failed to download model'
+        isDownloading.value = false
+        return
+      }
+    } catch (e) {
+      modelError.value = e instanceof Error ? e.message : 'Failed to download model'
+      isDownloading.value = false
+      return
+    }
+  }
 
   // Add user message
   const userMessage = chatsStore.addMessage({
@@ -154,8 +211,8 @@ async function sendMessage(content: string, images?: string[]) {
       })
     }
 
-    // Call the API
-    const response = await window.silo.ollama.chat({
+    // Call the unified models API
+    const response = await window.silo.models.chat({
       model: selectedModel.value,
       messages
     })
@@ -167,10 +224,12 @@ async function sendMessage(content: string, images?: string[]) {
     await chatsStore.saveCurrentChat()
   } catch (e) {
     console.error('Chat error:', e)
+    const errorMsg = e instanceof Error ? e.message : 'Failed to get response'
     chatsStore.completeMessage(
       assistantMessage.id,
-      `Error: ${e instanceof Error ? e.message : 'Failed to get response'}`
+      `Error: ${errorMsg}`
     )
+    modelError.value = errorMsg
   } finally {
     isStreaming.value = false
     streamingMessageId.value = null
@@ -263,6 +322,8 @@ function getTierClass(tierName: string): string {
           <ModelSelector
             v-model="selectedModel"
             :models="models"
+            :is-downloading="isDownloading"
+            :download-progress="downloadProgress?.progress"
           />
           <span
             v-if="hardwareStore.hardwareInfo"
@@ -275,6 +336,12 @@ function getTierClass(tierName: string): string {
           </button>
         </div>
       </header>
+
+      <!-- Error Banner -->
+      <div v-if="modelError" class="error-banner">
+        <span>{{ modelError }}</span>
+        <button @click="modelError = null">[x]</button>
+      </div>
 
       <!-- Messages -->
       <div ref="messagesRef" class="chat-messages">
@@ -356,6 +423,25 @@ function getTierClass(tierName: string): string {
 .badge-sm {
   font-size: var(--text-xs);
   padding: var(--space-1) var(--space-2);
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-4);
+  background: rgba(239, 68, 68, 0.1);
+  border-bottom: 1px solid rgba(239, 68, 68, 0.3);
+  color: #ef4444;
+  font-size: var(--text-xs);
+}
+
+.error-banner button {
+  background: transparent;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  padding: var(--space-1);
 }
 
 .chat-messages {

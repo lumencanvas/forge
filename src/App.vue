@@ -16,8 +16,6 @@ import FlowBuilderMulti from '@/components/flows/FlowBuilderMulti.vue'
 import FlowBuilderAI from '@/components/flows/FlowBuilderAI.vue'
 import FlowSchema from '@/components/flows/FlowSchema.vue'
 import FlowRunner from '@/components/flows/FlowRunner.vue'
-import OllamaStatus from '@/components/OllamaStatus.vue'
-import OllamaSetupGuide from '@/components/OllamaSetupGuide.vue'
 
 // View types
 type AppView =
@@ -48,9 +46,6 @@ const chatInitialMessage = ref<string | undefined>(undefined)
 const editingFlow = ref<Flow | undefined>(undefined)
 const runningFlow = ref<Flow | undefined>(undefined)
 
-// Ollama setup state
-const showOllamaSetup = ref(false)
-
 let cleanupHardwareListener: (() => void) | undefined
 
 onMounted(async () => {
@@ -66,6 +61,20 @@ onMounted(async () => {
   // Show setup modal if first run
   if (!settingsStore.setupComplete) {
     setupStore.show()
+  } else {
+    // Even if setup is complete, check if Ollama is available
+    // If not, show setup modal so user can see the system check
+    try {
+      const status = await window.silo.ollama.getStatus()
+      if (!status.isReady) {
+        setupStore.show()
+        setupStore.goToStep('system-check')
+      }
+    } catch (e) {
+      // If we can't get status, show setup modal
+      setupStore.show()
+      setupStore.goToStep('system-check')
+    }
   }
 })
 
@@ -155,36 +164,12 @@ function handleFlowGenerated(flow: Flow) {
 function handleFlowRunComplete() {
   openFlows()
 }
-
-function openOllamaSetup() {
-  showOllamaSetup.value = true
-}
-
-function closeOllamaSetup() {
-  showOllamaSetup.value = false
-}
-
-function handleOllamaConnected() {
-  showOllamaSetup.value = false
-}
 </script>
 
 <template>
   <div class="app">
-    <!-- Ollama Status Indicator -->
-    <div class="status-bar">
-      <OllamaStatus @setup-click="openOllamaSetup" />
-    </div>
-
     <!-- Setup Modal (first run) -->
     <SetupModal @complete="handleSetupComplete" />
-
-    <!-- Ollama Setup Guide -->
-    <OllamaSetupGuide
-      v-if="showOllamaSetup"
-      @close="closeOllamaSetup"
-      @connected="handleOllamaConnected"
-    />
 
     <!-- Home Screen -->
     <HomeScreen
@@ -260,14 +245,5 @@ function handleOllamaConnected() {
 <style scoped>
 .app {
   height: 100%;
-  position: relative;
-}
-
-.status-bar {
-  position: fixed;
-  top: 12px;
-  right: 12px;
-  z-index: 100;
-  -webkit-app-region: no-drag;
 }
 </style>

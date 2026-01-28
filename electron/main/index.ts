@@ -1,21 +1,36 @@
 /**
  * SILO - Main Electron Process
- * electron-vite + Vue 3 + Ollama integration
+ * electron-vite + Vue 3 + Multi-backend AI support
  */
 
 import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import { readFile } from 'fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { OllamaService } from './ollama'
 import { HardwareDetector, HardwareInfo } from './hardware'
 import { settingsService, type AppSettings, type Chat } from './settings'
+import {
+  getModelProviderManager,
+  type ModelPullProgress,
+  type ChatRequest,
+  type GenerateOptions,
+  type EmbedOptions,
+  type VisionOptions,
+  type AudioOptions,
+  type ImageGenOptions,
+  type HardwareTier,
+  type TaskType,
+  type ProviderType,
+  type CustomModelConfig
+} from './providers'
 
 // Keep global references
 let mainWindow: BrowserWindow | null = null
-let ollamaService: OllamaService
 let hardwareDetector: HardwareDetector
 let hardwareInfo: HardwareInfo
+
+// Get the provider manager singleton
+const providerManager = getModelProviderManager()
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -55,21 +70,36 @@ function createWindow(): void {
 async function initializeServices(): Promise<void> {
   // Hardware detection
   hardwareInfo = await hardwareDetector.detect()
-
   console.log(`SILO initialized - Hardware Tier: ${hardwareInfo.tier.name}`)
 
-  // Start Ollama service (no longer throws - just sets status)
-  await ollamaService.start()
-  const ollamaStatus = ollamaService.getStatus()
-  console.log(`[SILO] Ollama status: ${ollamaStatus.status}${ollamaStatus.error ? ` (${ollamaStatus.error})` : ''}`)
+  // Initialize all model providers with detected hardware tier
+  const providersStatus = await providerManager.initialize(hardwareInfo.tier.name as HardwareTier)
+  console.log(`[SILO] Providers initialized: ${providersStatus.providers.map(p => `${p.name}:${p.status}`).join(', ')}`)
+
+  // Set up pull progress callback
+  providerManager.setPullProgressCallback((progress: ModelPullProgress) => {
+    mainWindow?.webContents.send('models:pull-progress', progress)
+    // Also send to legacy channel for backwards compatibility
+    if (progress.provider === 'ollama') {
+      mainWindow?.webContents.send('ollama:pull-progress', {
+        model: progress.model.replace('ollama:', ''),
+        progress: progress.progress
+      })
+    }
+  })
 }
 
 function sendInitialState(): void {
   // Send initial hardware info to renderer
   mainWindow?.webContents.send('hardware:info', hardwareInfo)
 
-  // Send initial Ollama status to renderer
-  mainWindow?.webContents.send('ollama:status-change', ollamaService.getStatus())
+  // Send initial provider status to renderer
+  const providersStatus = providerManager.getStatus()
+  mainWindow?.webContents.send('models:status', providersStatus)
+
+  // Send legacy Ollama status for backwards compatibility
+  const ollamaProvider = providerManager.getOllamaProvider()
+  mainWindow?.webContents.send('ollama:status-change', ollamaProvider.getLegacyStatus())
 }
 
 // Setup IPC handlers
@@ -79,27 +109,190 @@ function setupIpcHandlers(): void {
     return hardwareDetector.detect(true)
   })
 
-  // Ollama
+  // ============================================
+  // NEW: Unified Model Provider API (models.*)
+  // ============================================
+
+  // Get status of all providers
+  ipcMain.handle('models:status', () => {
+    return providerManager.getStatus()
+  })
+
+  // List all models from all providers
+  ipcMain.handle('models:list', async () => {
+    return providerManager.listAllModels()
+  })
+
+  // Unified chat
+  ipcMain.handle('models:chat', async (_, request: ChatRequest) => {
+    return providerManager.chat(request)
+  })
+
+  // Unified generate
+  ipcMain.handle('models:generate', async (_, options: GenerateOptions) => {
+    return providerManager.generate(options)
+  })
+
+  // Unified embed
+  ipcMain.handle('models:embed', async (_, options: EmbedOptions) => {
+    return providerManager.embed(options)
+  })
+
+  // Vision tasks (image classification, object detection, etc.)
+  ipcMain.handle('models:vision', async (_, options: VisionOptions) => {
+    return providerManager.vision(options)
+  })
+
+  // Audio tasks (speech-to-text, etc.)
+  ipcMain.handle('models:audio', async (_, options: AudioOptions) => {
+    return providerManager.audio(options)
+  })
+
+  // Image generation
+  ipcMain.handle('models:image-gen', async (_, options: ImageGenOptions) => {
+    return providerManager.imageGen(options)
+  })
+
+  // Pull/download a model
+  ipcMain.handle('models:pull', async (_, modelId: string) => {
+    try {
+      const success = await providerManager.pullModel(modelId)
+      return { success }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  })
+
+  // Get recommended model for a task
+  ipcMain.handle('models:recommend', (_, task: TaskType, preferredProvider?: ProviderType) => {
+    return providerManager.getRecommendedModel(task, preferredProvider)
+  })
+
+  // Refresh provider status
+  ipcMain.handle('models:refresh', async () => {
+    const status = await providerManager.initialize(hardwareInfo.tier.name as HardwareTier)
+    mainWindow?.webContents.send('models:status', status)
+    return status
+  })
+
+  // Get model status (downloaded, loaded, etc.)
+  ipcMain.handle('models:get-status', async (_, modelId: string) => {
+    return providerManager.getModelStatus(modelId)
+  })
+
+  // Delete a model
+  ipcMain.handle('models:delete', async (_, modelId: string) => {
+    try {
+      const success = await providerManager.deleteModel(modelId)
+      return { success }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  })
+
+  // Load a model into memory
+  ipcMain.handle('models:load', async (_, modelId: string) => {
+    try {
+      const success = await providerManager.loadModel(modelId)
+      return { success }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  })
+
+  // Unload a model from memory
+  ipcMain.handle('models:unload', async (_, modelId: string) => {
+    try {
+      const success = await providerManager.unloadModel(modelId)
+      return { success }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  })
+
+  // Get loaded models
+  ipcMain.handle('models:loaded', () => {
+    return providerManager.getLoadedModels()
+  })
+
+  // Get model registry
+  ipcMain.handle('models:registry', () => {
+    return providerManager.getRegistry()
+  })
+
+  // Get models for a specific task
+  ipcMain.handle('models:for-task', async (_, task: TaskType) => {
+    return providerManager.getModelsForTask(task)
+  })
+
+  // Add custom model
+  ipcMain.handle('models:add-custom', async (_, config: CustomModelConfig) => {
+    try {
+      providerManager.addCustomModel(config)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
+  })
+
+  // ============================================
+  // System Stats API (system.*)
+  // ============================================
+
+  ipcMain.handle('system:stats', async () => {
+    return providerManager.getSystemStats()
+  })
+
+  // ============================================
+  // LEGACY: Ollama-specific API (for backwards compatibility)
+  // ============================================
+
   ipcMain.handle('ollama:status', () => {
-    return ollamaService.getStatus()
+    return providerManager.getOllamaProvider().getLegacyStatus()
   })
 
   ipcMain.handle('ollama:check-connection', async () => {
-    // Attempt to reconnect
-    await ollamaService.start()
-    const status = ollamaService.getStatus()
+    const ollamaProvider = providerManager.getOllamaProvider()
+    await ollamaProvider.start()
+    const status = ollamaProvider.getLegacyStatus()
     mainWindow?.webContents.send('ollama:status-change', status)
+    // Also update unified status
+    mainWindow?.webContents.send('models:status', providerManager.getStatus())
     return status
   })
 
   ipcMain.handle('ollama:list', async () => {
-    return ollamaService.listModels()
+    const ollamaProvider = providerManager.getOllamaProvider()
+    const status = ollamaProvider.getLegacyStatus()
+
+    if (status.status === 'error') {
+      return {
+        models: [],
+        status: status.status,
+        error: status.error || 'Ollama is not available'
+      }
+    }
+
+    const models = await ollamaProvider.listModels()
+    return {
+      models: models.map(m => ({
+        name: m.name,
+        size: m.size,
+        digest: '',
+        modified_at: ''
+      })),
+      status: 'ready'
+    }
   })
 
   ipcMain.handle('ollama:pull', async (_, model: string) => {
-    return ollamaService.pullModel(model, (progress) => {
-      mainWindow?.webContents.send('ollama:pull-progress', { model, progress })
-    })
+    const modelId = model.includes(':') ? model : `ollama:${model}`
+    try {
+      const success = await providerManager.pullModel(modelId)
+      return { success }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
   })
 
   ipcMain.handle('ollama:generate', async (_, opts: {
@@ -108,17 +301,44 @@ function setupIpcHandlers(): void {
     images?: string[]
     stream?: boolean
   }) => {
-    return ollamaService.generate(opts.model, opts.prompt, opts.images)
+    const result = await providerManager.generate({
+      model: opts.model.includes(':') ? opts.model : `ollama:${opts.model}`,
+      prompt: opts.prompt,
+      images: opts.images
+    })
+    // Convert to legacy format
+    return {
+      model: result.model,
+      created_at: new Date().toISOString(),
+      response: result.response,
+      done: result.done,
+      total_duration: result.totalDuration
+    }
   })
 
   ipcMain.handle('ollama:chat', async (_, opts: {
     model: string
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string; images?: string[] }>
   }) => {
-    return ollamaService.chat(opts.model, opts.messages)
+    const result = await providerManager.chat({
+      model: opts.model.includes(':') ? opts.model : `ollama:${opts.model}`,
+      messages: opts.messages
+    })
+    // Convert to legacy format
+    return {
+      model: result.model,
+      created_at: new Date().toISOString(),
+      message: result.message,
+      done: result.done,
+      total_duration: result.totalDuration,
+      eval_count: result.evalCount
+    }
   })
 
+  // ============================================
   // Dialogs
+  // ============================================
+
   ipcMain.handle('dialog:openFiles', async () => {
     if (!mainWindow) return []
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -251,11 +471,10 @@ app.whenReady().then(async () => {
     optimizer.watchWindowShortcuts(window)
   })
 
-  // Initialize services
+  // Initialize hardware detector
   hardwareDetector = new HardwareDetector()
-  ollamaService = new OllamaService()
 
-  // Initialize services FIRST (hardware detection + Ollama connection)
+  // Initialize services FIRST (hardware detection + provider initialization)
   // This ensures services are ready before renderer can call them
   await initializeServices()
 
@@ -281,5 +500,5 @@ app.on('window-all-closed', () => {
 
 // Cleanup on quit
 app.on('before-quit', async () => {
-  await ollamaService?.stop()
+  await providerManager.cleanup()
 })

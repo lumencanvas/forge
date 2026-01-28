@@ -130,6 +130,8 @@ function handleDelete(e: Event, chatId: string) {
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-3);
+  /* Account for macOS traffic light buttons */
+  padding-top: 40px;
   border-bottom: var(--border-width) solid var(--color-border);
 }
 
