@@ -92,7 +92,7 @@ function handleDelete(e: Event, chatId: string) {
 
       <div v-for="group in groupedChats" :key="group.label" class="chat-group">
         <div class="group-label">{{ group.label }}</div>
-        <button
+        <div
           v-for="chat in group.chats"
           :key="chat.id"
           :class="['chat-item', { active: chat.id === currentChatId }]"
@@ -102,7 +102,7 @@ function handleDelete(e: Event, chatId: string) {
           <button class="chat-delete" @click="(e) => handleDelete(e, chat.id)">
             ✕
           </button>
-        </button>
+        </div>
       </div>
     </div>
   </aside>

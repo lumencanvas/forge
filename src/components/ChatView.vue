@@ -74,15 +74,18 @@ onMounted(async () => {
       m.capabilities.includes('chat') || m.capabilities.includes('generate')
     )
 
-    // Set default model - prefer installed models
+    // Set default model - prefer instruction-tuned models
     const installedModels = models.value.filter(m => m.isInstalled)
     if (settingsStore.defaultLanguageModel) {
       selectedModel.value = settingsStore.defaultLanguageModel
     } else if (installedModels.length > 0) {
-      selectedModel.value = installedModels[0]!.id
+      // Prefer flan-t5 if available (instruction-tuned)
+      const flanT5 = installedModels.find(m => m.id.includes('flan-t5'))
+      selectedModel.value = flanT5?.id || installedModels[0]!.id
     } else if (models.value.length > 0) {
-      // Fallback to first available (will need download)
-      selectedModel.value = models.value[0]!.id
+      // Default to flan-t5-small (instruction-tuned, works well for chat)
+      const flanT5 = models.value.find(m => m.id === 'transformers:flan-t5-small')
+      selectedModel.value = flanT5?.id || 'transformers:flan-t5-small'
     }
   } catch (e) {
     console.error('Failed to load models:', e)
